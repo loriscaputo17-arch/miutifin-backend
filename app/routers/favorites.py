@@ -40,7 +40,7 @@ def check_favorite(
 def remove_favorite(
     payload: dict,
     user_id: str = Depends(get_current_user),
-):
+): 
     supabase.table("user_favorites") \
         .delete() \
         .eq("user_id", user_id) \

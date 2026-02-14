@@ -1,195 +1,332 @@
 from fastapi import APIRouter, HTTPException, Query
-from app.core.database import supabase
-from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+from typing import Optional, Dict, List, Tuple
+from datetime import datetime
+import hashlib
+import json
+import logging
+import re
+
+import pytz
 import requests
+from bs4 import BeautifulSoup
+from slugify import slugify
+from dateutil.relativedelta import relativedelta
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from app.core.database import supabase
+
+from pydantic import BaseModel
+
+class DiceIngestRequest(BaseModel):
+    url: str
+    city_slug: str
+# ==================================================
+# SETUP
+# ==================================================
 
 router = APIRouter(prefix="/ingestions", tags=["ingestions"])
+logger = logging.getLogger(__name__)
+
+SOURCE_NAME = "dice"
+
+session = requests.Session()
+session.mount(
+    "https://",
+    HTTPAdapter(
+        max_retries=Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+    )
+)
+
+MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4,
+    "may": 5, "jun": 6, "jul": 7,
+    "aug": 8, "sep": 9, "oct": 10,
+    "nov": 11, "dec": 12,
+    "gen": 1, "mag": 5, "giu": 6, "lug": 7,
+    "ago": 8, "set": 9, "ott": 10, "dic": 12,
+}
+
+# ==================================================
+# UTILS
+# ==================================================
+
+def checksum(payload: dict) -> str:
+    raw = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+def json_safe(obj):
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [json_safe(v) for v in obj]
+    return obj
+
+def parse_price(text: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
+    if not text:
+        return None, None
+
+    t = text.lower()
+    if "gratis" in t or "free" in t:
+        return 0, 0
+
+    nums = [
+        float(n.replace(",", "."))
+        for n in re.findall(r"\d+(?:[.,]\d+)?", t)
+    ]
+
+    if not nums:
+        return None, None
+
+    return min(nums), max(nums)
 
 
-# --------------------------------------------------
-# CATEGORY INFERENCE (ALIGNED WITH DB)
-# --------------------------------------------------
+def parse_dice_date(text: str, timezone: str) -> Optional[datetime]:
+    if not text:
+        return None
 
-def infer_category_slug_from_dice_url(url: str) -> str:
-    """
-    Returns a category.slug that MUST exist in categories (type=event)
-    """
-    path = urlparse(url).path.lower().strip("/")
-    parts = path.split("/")
+    tokens = text.lower().split("-")[0].split()
+    if len(tokens) < 2:
+        return None
 
-    # -------- MUSIC --------
-    if "music" in parts:
-        if any(p in parts for p in ["dj", "party", "afrohouse", "house", "techno"]):
-            return "club-night"
+    try:
+        day = int(tokens[-2])
+        month = MONTHS.get(tokens[-1][:3])
+        if not month:
+            return None
 
-        if any(p in parts for p in ["gig", "live", "band"]):
-            return "concert"
+        tz = pytz.timezone(timezone)
+        now = datetime.now(tz)
 
-        return "live-music"
+        dt = tz.localize(datetime(now.year, month, day, 21, 0))
 
-    # -------- CULTURE --------
-    if "culture" in parts:
-        if "film" in parts or "cinema" in parts:
-            return "cinema"
+        if dt < now - relativedelta(days=1):
+            dt += relativedelta(years=1)
 
-        if "comedy" in parts:
-            return "comedy"
+        return dt
+    except Exception:
+        return None
 
-        if "theatre" in parts:
-            return "theatre"
+def extract_title(card):
+    for sel in [
+        "[class*='Title']",
+        "[data-testid*='event-title']",
+        "span",
+        "div"
+    ]:
+        el = card.select_one(sel)
+        if el and el.text.strip():
+            return el.text.strip()
+    return None
 
-        if "art" in parts:
-            return "art"
-
-        if "foodanddrink" in parts:
-            return "food-drink"
-
-        if "sport" in parts:
-            return "sport"
-
-        if "social" in parts:
-            return "social"
-
-        return "event"
-
-    # -------- FESTIVAL --------
-    if "festival" in parts:
-        return "festival"
-
-    return "event"
-
-
-# --------------------------------------------------
-# HTML PARSER (DICE)
-# --------------------------------------------------
-
-def extract_dice_events_from_html(html: str) -> list[dict]:
+def extract_dice_events(html: str) -> List[Dict]:
     soup = BeautifulSoup(html, "html.parser")
-    cards = soup.select("div.EventCard__Event-sc-5ea8797e-1")
+    events = []
 
-    events: list[dict] = []
-
-    for card in cards:
-        link = card.select_one("a[href^='/event/']")
-        if not link:
+    for link in soup.select("a[href^='/event/']"):
+        card = link.find_parent("div")
+        if not card:
             continue
 
-        def text(selector: str):
-            el = card.select_one(selector)
+        def text(sel):
+            el = card.select_one(sel)
             return el.text.strip() if el else None
 
-        img_el = card.select_one("div.styles__ImageWrapper-sc-4cc6fa9-2 img")
-        image_url = img_el["src"] if img_el and img_el.has_attr("src") else None
+        img = card.select_one("img")
 
         events.append({
             "source_url": "https://dice.fm" + link["href"],
-            "title": text(".styles__Title-sc-4cc6fa9-6"),
-            "date_text": text(".styles__DateText-sc-4cc6fa9-8"),
-            "venue_name": text(".styles__Venue-sc-4cc6fa9-7"),
-            "price_text": text(".styles__Price-sc-4cc6fa9-9"),
-            "image": image_url,
+            "title": extract_title(card),
+            "date_text": text("[class*='Date']"),
+            "venue": text("[class*='Venue']"),
+            "price_text": text("[class*='Price']"),
+            "image": img["src"] if img else None,
         })
 
     return events
 
 
-# --------------------------------------------------
-# API ENDPOINT
-# --------------------------------------------------
+def fetch_event_detail(url: str) -> Dict:
+    r = session.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    def meta(prop):
+        tag = soup.select_one(f"meta[property='{prop}']")
+        return tag["content"] if tag else None
+
+    return {
+        "description": meta("og:description"),
+        "image": meta("og:image"),
+    }
+
+
+# ==================================================
+# API
+# ==================================================
 
 @router.post("/dice")
-def ingest_dice(
-    url: str = Query(..., description="Dice browse URL"),
-    city_slug: str = Query(..., description="City slug (milano, roma, berlin, etc)")
-):
-    # ---- validate URL
-    if not url.startswith("https://dice.fm/"):
+def ingest_dice(payload: DiceIngestRequest):
+    url = payload.url
+    city_slug = payload.city_slug
+
+    if not url.startswith("https://dice.fm"):
         raise HTTPException(400, "Invalid DICE URL")
 
-    # ---- city lookup
-    city_res = supabase.table("cities") \
-        .select("id") \
+    # ------------------------------
+    # resolve city + source
+    # ------------------------------
+
+    city = supabase.table("cities") \
+        .select("id, timezone") \
         .eq("slug", city_slug) \
         .single() \
         .execute()
 
-    if not city_res.data:
-        raise HTTPException(400, f"City '{city_slug}' not found")
+    if not city.data:
+        raise HTTPException(404, "City not found")
 
-    city_id = city_res.data["id"]
-
-    # ---- infer category
-    category_slug = infer_category_slug_from_dice_url(url)
-
-    cat_res = supabase.table("categories") \
+    source = supabase.table("sources") \
         .select("id") \
-        .eq("slug", category_slug) \
-        .eq("type", "event") \
+        .eq("name", SOURCE_NAME) \
         .single() \
         .execute()
 
-    category_id = cat_res.data["id"] if cat_res.data else None
+    if not source.data:
+        raise HTTPException(400, "Source 'dice' not configured")
 
-    # ---- fetch page
+    city_id = city.data["id"]
+    timezone = city.data["timezone"]
+    source_id = source.data["id"]
+
+    # ------------------------------
+    # start ingestion run
+    # ------------------------------
+
+    ingestion = supabase.table("ingestions").insert({
+        "source_id": source_id,
+        "city_id": city_id,
+        "status": "running",
+    }).execute()
+
+    ingestion_id = ingestion.data[0]["id"]
+
+    inserted = skipped = errors = 0
+
     try:
-        res = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=20
-        )
-        res.raise_for_status()
-        html = res.text
+        r = session.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+
+        items = extract_dice_events(r.text)
+
+        existing = {
+            s["source_url"]
+            for s in supabase.table("submissions")
+                .select("source_url")
+                .eq("source", SOURCE_NAME)
+                .eq("city_id", city_id)
+                .execute().data
+        }
+
+        for item in items:
+            if not item.get("title") or item["source_url"] in existing:
+                skipped += 1
+                continue
+
+            try:
+                detail = fetch_event_detail(item["source_url"])
+                start_at = parse_dice_date(item["date_text"], timezone)
+                price_min, price_max = parse_price(item["price_text"])
+
+                payload = {
+                    **item,
+                    **detail,
+                    "start_at": start_at.isoformat() if start_at else None,
+                    "price_min": price_min,
+                    "price_max": price_max,
+                }
+
+                # --------------------------
+                # RAW ITEMS
+                # --------------------------
+
+                supabase.table("raw_items").insert({
+                    "source_id": source_id,
+                    "city_id": city_id,
+                    "url": item["source_url"],
+                    "checksum": checksum(payload),
+                    "payload_json": payload,
+                }).execute()
+
+                # --------------------------
+                # SUBMISSIONS
+                # --------------------------
+
+                description = (
+                    detail["description"]
+                    or " · ".join(
+                        p for p in [
+                            item["venue"],
+                            item["date_text"],
+                            item["price_text"],
+                        ] if p
+                    )
+                )
+
+                supabase.table("submissions").insert({
+                    "city_id": city_id,
+                    "source": SOURCE_NAME,
+                    "source_url": item["source_url"],
+                    "title": item["title"],
+                    "description": description,
+
+                    "start_at": start_at.isoformat() if start_at else None,
+                    "end_at": None,
+                    "price_min": price_min,
+                    "price_max": price_max,
+                    "venue_name": item["venue"],
+                    "venue_address": None,
+                    "source_payload": json_safe(payload),
+                    "ingestion_id": ingestion_id,
+
+                    "lat": None,
+                    "lng": None,
+                    "confidence": 60,
+                    "status": "visible",
+                    "image": detail["image"] or item["image"],
+                }).execute()
+
+                inserted += 1
+
+            except Exception:
+                logger.exception(f"Failed item {item['source_url']}")
+                errors += 1
+
+        supabase.table("ingestions").update({
+            "status": "success",
+            "ended_at": datetime.utcnow().isoformat()
+        }).eq("id", ingestion_id).execute()
+
     except Exception as e:
-        raise HTTPException(500, f"Failed to fetch DICE page: {e}")
-
-    # ---- parse events
-    events = extract_dice_events_from_html(html)
-
-    inserted = 0
-    skipped = 0
-
-    for e in events:
-        # dedup by source_url
-        exists = supabase.table("submissions") \
-            .select("id") \
-            .eq("source_url", e["source_url"]) \
-            .execute()
-
-        if exists.data:
-            skipped += 1
-            continue
-
-        description_parts = [
-            e.get("venue_name"),
-            e.get("date_text"),
-            e.get("price_text"),
-        ]
-
-        description = " · ".join([p for p in description_parts if p])
-
-        supabase.table("submissions").insert({
-            "city_id": city_id,
-            "source": "scraper:dice",
-            "source_url": e["source_url"],
-            "title": e["title"],
-            "description": description,
-            "image": e["image"],
-            "category_id": category_id,
-            "lat": None,
-            "lng": None,
-            "confidence": 55,
-            "status": "draft",
-        }).execute()
-
-        inserted += 1
+        supabase.table("ingestions").update({
+            "status": "failed",
+            "ended_at": datetime.utcnow().isoformat(),
+            "error": str(e)
+        }).eq("id", ingestion_id).execute()
+        raise
 
     return {
-        "source": "dice",
+        "source": SOURCE_NAME,
         "city": city_slug,
-        "url": url,
-        "category": category_slug,
-        "found": len(events),
+        "found": len(items),
         "inserted": inserted,
         "skipped": skipped,
+        "errors": errors,
     }

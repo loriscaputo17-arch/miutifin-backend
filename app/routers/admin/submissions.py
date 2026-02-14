@@ -12,17 +12,32 @@ def slugify(text: str) -> str:
     text = re.sub(r"\s+", "-", text)
     return text.strip("-")
 
+def unique_event_slug(city_id: str, base: str) -> str:
+    slug = base
+    i = 1
+
+    while True:
+        exists = supabase.table("events") \
+            .select("id") \
+            .eq("city_id", city_id) \
+            .eq("slug", slug) \
+            .execute()
+
+        if not exists.data:
+            return slug
+
+        i += 1
+        slug = f"{base}-{i}"
+
 @router.get("/submissions")
 def list_submissions():
     return supabase.table("submissions") \
         .select("*") \
-        .eq("status", "draft") \
         .order("created_at", desc=True) \
         .execute().data
 
 @router.post("/submissions/{submission_id}/promote/event")
 def promote_submission_to_event(submission_id: str):
-    # ---- fetch submission
     sub_res = supabase.table("submissions") \
         .select("*") \
         .eq("id", submission_id) \
@@ -37,21 +52,40 @@ def promote_submission_to_event(submission_id: str):
     if s["status"] == "promoted":
         raise HTTPException(400, "Submission already promoted")
 
-    slug = slugify(s["title"])
+    # invece di bloccare
+    if not s.get("start_at"):
+        start_at = None
+    else:
+        start_at = s["start_at"]
+
+    base_slug = slugify(s["title"])
+    slug = unique_event_slug(s["city_id"], base_slug)
+
     now_iso = datetime.utcnow().isoformat()
 
     # ---- create event
     event_res = supabase.table("events").insert({
         "city_id": s["city_id"],
+        "place_id": None,  # ⚠️ lo collegherai dopo
         "category_id": s["category_id"],
         "title": s["title"],
         "slug": slug,
         "description": s["description"],
-        "source_url": s.get("source_url"),     # ✅ PROMOSSO
-        "start_at": now_iso,
-        "cover_image": s.get("image"),          # ✅ IMAGE → COVER
-        "price_min": None,
-        "price_max": None,
+
+        # ✅ DATI EVENTO REALI
+        "start_at": s["start_at"],
+        "end_at": s["end_at"],
+        "price_min": s["price_min"],
+        "price_max": s["price_max"],
+
+        # ✅ VENUE (NUOVO)
+        "venue_name": s.get("venue_name"),
+
+        # ✅ MEDIA / SOURCE
+        "cover_image": s["image"],
+        "source_url": s["source_url"],
+
+        # ✅ GEO
         "lat": s["lat"],
         "lng": s["lng"],
     }).execute()
@@ -71,9 +105,9 @@ def promote_submission_to_event(submission_id: str):
 
     return {
         "status": "ok",
-        "event_id": event_id
+        "event_id": event_id,
+        "slug": slug,
     }
-
 
 @router.post("/submissions/{id}/promote/place")
 def promote_submission_to_place(id: str):
@@ -100,3 +134,62 @@ def promote_submission_to_place(id: str):
     }).eq("id", id).execute()
 
     return place
+
+@router.put("/events/{event_id}")
+def update_event(event_id: str, payload: dict):
+    # ---- fetch event
+    event_res = supabase.table("events") \
+        .select("*") \
+        .eq("id", event_id) \
+        .single() \
+        .execute()
+
+    if not event_res.data:
+        raise HTTPException(404, "Event not found")
+
+    e = event_res.data
+
+    updates = {}
+    now_iso = datetime.utcnow().isoformat()
+
+    # ---- title + slug
+    if "title" in payload and payload["title"] != e["title"]:
+        base_slug = slugify(payload["title"])
+        slug = unique_event_slug(e["city_id"], base_slug)
+
+        updates["title"] = payload["title"]
+        updates["slug"] = slug
+
+    # ---- simple fields
+    for field in [
+        "description",
+        "start_at",
+        "end_at",
+        "price_min",
+        "price_max",
+        "venue_name",
+        "cover_image",
+        "source_url",
+        "lat",
+        "lng",
+        "category_id",
+        "place_id",
+    ]:
+        if field in payload:
+            updates[field] = payload[field]
+
+    if not updates:
+        return e  # niente da aggiornare
+
+    updates["updated_at"] = now_iso
+
+    # ---- update
+    res = supabase.table("events") \
+        .update(updates) \
+        .eq("id", event_id) \
+        .execute()
+
+    if not res.data:
+        raise HTTPException(500, "Failed to update event")
+
+    return res.data[0]
