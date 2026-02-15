@@ -8,3 +8,5 @@ httpx
 python-jose
 pytz
 python-slugify
+Pillow
+qrcode[pil]
